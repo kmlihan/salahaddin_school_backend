@@ -1,0 +1,1589 @@
+models/Admin.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const adminSchema = new mongoose.Schema(
+  {
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true, minlength: 6 },
+    phone: { type: String, default: '' },
+    photo: { type: String, default: '' },
+    role: { type: String, default: 'admin', immutable: true },
+    // Password reset
+    resetTokenHash: { type: String, default: '' },
+    resetTokenExpires: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
+adminSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
+
+adminSchema.methods.matchPassword = function (entered) {
+  return bcrypt.compare(entered, this.password);
+};
+
+module.exports = mongoose.model('Admin', adminSchema);
+
+
+models/Attendance.js
+const mongoose = require('mongoose');
+
+const attendanceSchema = new mongoose.Schema(
+  {
+    student: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
+    date: { type: Date, required: true },
+    status: { type: String, enum: ['present', 'absent', 'late', 'excused'], required: true },
+    lesson: { type: mongoose.Schema.Types.ObjectId, ref: 'Lesson' },
+    note: { type: String, default: '' },
+    recordedBy: { type: mongoose.Schema.Types.ObjectId },
+    recordedByRole: { type: String, enum: ['admin', 'teacher'] },
+  },
+  { timestamps: true }
+);
+
+attendanceSchema.index({ student: 1, date: -1 });
+
+module.exports = mongoose.model('Attendance', attendanceSchema);
+
+
+models/CalendarEntry.js
+const mongoose = require('mongoose');
+
+/**
+ * Two distinct kinds of entries live here:
+ *
+ *  - kind: 'assignment'   admin assigns a teacher + lesson(s) to a date/time slot
+ *  - kind: 'availability' teacher submits a window they are available
+ *
+ * Querying by date range is the primary access pattern, hence the index.
+ */
+const calendarEntrySchema = new mongoose.Schema(
+  {
+    kind: { type: String, enum: ['assignment', 'availability'], required: true },
+    date: { type: Date, required: true },
+    startTime: { type: String, default: '' },  // 'HH:mm'
+    endTime: { type: String, default: '' },
+
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher' },
+    lessons: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Lesson' }],
+
+    title: { type: String, default: '' },
+    notes: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+
+calendarEntrySchema.index({ date: 1, kind: 1, teacher: 1 });
+
+module.exports = mongoose.model('CalendarEntry', calendarEntrySchema);
+
+
+models/Exam.js
+const mongoose = require('mongoose');
+const { MultiLangString } = require('./_shared');
+
+/**
+ * One question in an exam. Supports MCQ, true/false, matching, fill-blanks,
+ * ordering, and short-answer. Fields not relevant to the active type are
+ * simply ignored.
+ *
+ *   mcq          -> options[], correctIndices[]
+ *   truefalse    -> correctBoolean
+ *   matching     -> matchPairs[{ left, right }] (server presents shuffled, scores by pair)
+ *   fillblank    -> blanks[{ acceptable: [str] }]   (per-blank acceptable answers, per language)
+ *   ordering     -> items[] in correct order; client shuffles
+ *   shortanswer  -> acceptableAnswers[] (per language; manual review possible too)
+ */
+const questionSchema = new mongoose.Schema(
+  {
+    type: {
+      type: String,
+      enum: ['mcq', 'truefalse', 'matching', 'fillblank', 'ordering', 'shortanswer'],
+      required: true,
+    },
+    question: { type: MultiLangString, required: true },
+    score: { type: Number, default: 1 },
+
+    // MCQ
+    options: [{ type: MultiLangString }],
+    correctIndices: [{ type: Number }], // supports single or multi-correct
+
+    // True / False
+    correctBoolean: { type: Boolean },
+
+    // Matching
+    matchPairs: [
+      {
+        left: { type: MultiLangString },
+        right: { type: MultiLangString },
+      },
+    ],
+
+    // Fill in the blanks: question text contains "___" placeholders;
+    // `blanks[i].acceptable` is the list of acceptable values for the i-th blank.
+    blanks: [
+      {
+        acceptable: [{ type: String }], // case-insensitive compare on the server
+      },
+    ],
+
+    // Ordering: `items` are stored in the correct order.
+    items: [{ type: MultiLangString }],
+
+    // Short answer: acceptable answers (also a free-text record is kept for review)
+    acceptableAnswers: [{ type: String }],
+  },
+  { _id: true }
+);
+
+const examSchema = new mongoose.Schema(
+  {
+    title: { type: MultiLangString, required: true },
+    section: { type: String, required: true },
+    level: { type: String, enum: ['A', 'B', 'C', 'D'], required: true },
+
+    // 'lessons' = covers a subset of lessons in a unit
+    // 'unit'    = final exam for a whole unit (passing it unlocks the next unit)
+    type: { type: String, enum: ['lessons', 'unit'], required: true },
+
+    // Linked content
+    lessons: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Lesson' }],
+    unit: { type: mongoose.Schema.Types.ObjectId },           // logical unit id, used for unlock
+    unitName: { type: MultiLangString, default: () => ({}) },
+
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher' },
+
+    questions: [questionSchema],
+    passingGrade: { type: Number, default: 50 }, // percentage
+  },
+  { timestamps: true }
+);
+
+examSchema.index({ level: 1, section: 1 });
+
+module.exports = mongoose.model('Exam', examSchema);
+
+
+models/ExamResult.js
+const mongoose = require('mongoose');
+
+/**
+ * A submitted exam attempt. Stores the student's raw answers, the per-question
+ * computed score, totals, and pass/fail. The shape of `answer` depends on the
+ * question type (boolean, number[], string, string[], etc) — the controller
+ * grades and shapes them before persisting.
+ */
+const examResultSchema = new mongoose.Schema(
+  {
+    student: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
+    exam: { type: mongoose.Schema.Types.ObjectId, ref: 'Exam', required: true },
+
+    answers: [
+      {
+        questionId: { type: mongoose.Schema.Types.ObjectId, required: true },
+        answer: { type: mongoose.Schema.Types.Mixed },
+        scoreEarned: { type: Number, default: 0 },
+        scoreMax: { type: Number, default: 0 },
+        correct: { type: Boolean, default: false },
+        feedback: { type: String, default: '' }, // optional teacher feedback
+      },
+    ],
+
+    totalScore: { type: Number, default: 0 },
+    maxScore: { type: Number, default: 0 },
+    percentage: { type: Number, default: 0 },
+    passed: { type: Boolean, default: false },
+
+    submittedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+examResultSchema.index({ student: 1, exam: 1 });
+
+module.exports = mongoose.model('ExamResult', examResultSchema);
+
+
+models/Expense.js
+const mongoose = require('mongoose');
+
+const expenseSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true },
+    description: { type: String, default: '' },
+    category: { type: String, default: 'general' }, // 'supplies', 'maintenance', 'other'
+    amount: { type: Number, required: true, min: 0 },
+    date: { type: Date, default: Date.now },
+    receiptUrl: { type: String, default: '' },
+    status: { type: String, enum: ['needed', 'approved', 'purchased'], default: 'needed' },
+    recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Expense', expenseSchema);
+
+
+models/Homework.js
+const mongoose = require('mongoose');
+const { MultiLangString } = require('./_shared');
+
+/**
+ * One prompt inside a writing homework. The teacher writes the partial
+ * fragment (e.g. `بـ ـ ـ ـ`) in the multi-language `prompt` field, and a
+ * single canonical `answer` string the student is supposed to type. The
+ * student's answer is graded with a simple normalised case-insensitive
+ * compare on the server (Arabic doesn't have case, but we still trim and
+ * collapse whitespace so trailing diacritics don't break a match).
+ */
+const writingPromptSchema = new mongoose.Schema(
+  {
+    prompt: { type: MultiLangString, required: true },
+    answer: { type: String, required: true, trim: true },
+  },
+  { _id: false }
+);
+
+/**
+ * Homework. One document per assignment.
+ *
+ *   kind = 'writing'           -> uses `prompts[]`
+ *   kind = 'recordedReading'   -> student uploads an audio recording
+ *   kind = 'bookReading'       -> student reads a physical page; parent
+ *                                 leaves a note in the submission
+ *
+ * `level` scopes the homework to all students at that level. Optionally,
+ * `assignedTo` narrows it to a specific subset of students. An empty
+ * `assignedTo` means "everyone at this level".
+ */
+const homeworkSchema = new mongoose.Schema(
+  {
+    kind: {
+      type: String,
+      enum: ['writing', 'recordedReading', 'bookReading'],
+      required: true,
+    },
+    title: { type: MultiLangString, required: true },
+    instructions: { type: MultiLangString, default: () => ({}) },
+    level: { type: String, enum: ['A', 'B', 'C', 'D'], required: true },
+    assignedTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Student' }],
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher' },
+    dueDate: { type: Date, default: null },
+    prompts: { type: [writingPromptSchema], default: undefined }, // writing only
+  },
+  { timestamps: true }
+);
+
+homeworkSchema.index({ level: 1, dueDate: 1 });
+
+module.exports = mongoose.model('Homework', homeworkSchema);
+
+
+models/HomeworkSubmission.js
+const mongoose = require('mongoose');
+const { MultiLangString } = require('./_shared');
+
+/**
+ * A student's submission for one homework. There's at most one of these
+ * per (homework, student) pair — re-submissions update the same document
+ * via upsert.
+ *
+ * The relevant fields depend on `kind`:
+ *
+ *   writing         -> answers: [String]   (one per prompt, position-aligned)
+ *                      autoScore: Number   (0..100, computed at submit time)
+ *
+ *   recordedReading -> audioUrl: String    (path returned by /api/upload)
+ *
+ *   bookReading     -> parentNote: MultiLangString
+ *                      parentNoteBy: ObjectId (Parent who wrote it)
+ *                      confirmedByParent: Boolean (set when a parent saves
+ *                                                  a note — flips the
+ *                                                  homework into "done")
+ *
+ * Teacher feedback and a manual score are available regardless of kind.
+ */
+const submissionSchema = new mongoose.Schema(
+  {
+    homework: { type: mongoose.Schema.Types.ObjectId, ref: 'Homework', required: true },
+    student:  { type: mongoose.Schema.Types.ObjectId, ref: 'Student',  required: true },
+    kind: {
+      type: String,
+      enum: ['writing', 'recordedReading', 'bookReading'],
+      required: true,
+    },
+
+    // writing
+    answers: [{ type: String }],
+    autoScore: { type: Number, default: null },
+
+    // recordedReading
+    audioUrl: { type: String, default: '' },
+
+    // bookReading
+    parentNote: { type: MultiLangString, default: () => ({}) },
+    parentNoteBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Parent' },
+    confirmedByParent: { type: Boolean, default: false },
+
+    // teacher review
+    teacherFeedback: { type: MultiLangString, default: () => ({}) },
+    teacherScore: { type: Number, default: null },
+
+    submittedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+submissionSchema.index({ homework: 1, student: 1 }, { unique: true });
+
+module.exports = mongoose.model('HomeworkSubmission', submissionSchema);
+
+
+models/Lesson.js
+const mongoose = require('mongoose');
+const { MultiLangString, ContentBlock } = require('./_shared');
+
+const lessonSchema = new mongoose.Schema(
+  {
+    title: { type: MultiLangString, required: true },
+    section: { type: String, required: true }, // e.g. 'Arabic', 'Quran', 'Sira'
+    unit: { type: mongoose.Schema.Types.ObjectId, ref: 'Unit' }, // optional grouping
+    unitName: { type: MultiLangString, default: () => ({}) }, // simple inline unit label
+    order: { type: Number, default: 0 },
+    level: { type: String, enum: ['A', 'B', 'C', 'D'], required: true },
+
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher' },
+
+    // Reorderable content blocks (image / text / video / image+audio).
+    blocks: [ContentBlock],
+  },
+  { timestamps: true }
+);
+
+// Helpful indexes for the common student query (by level + section, ordered).
+lessonSchema.index({ level: 1, section: 1, order: 1 });
+
+module.exports = mongoose.model('Lesson', lessonSchema);
+
+
+models/News.js
+const mongoose = require('mongoose');
+const { MultiLangString, ContentBlock } = require('./_shared');
+
+const newsSchema = new mongoose.Schema(
+  {
+    title: { type: MultiLangString, required: true },
+    blocks: [ContentBlock],
+    coverImage: { type: String, default: '' },
+    published: { type: Boolean, default: true },
+    author: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('News', newsSchema);
+
+
+models/Note.js
+const mongoose = require('mongoose');
+const { MultiLangString } = require('./_shared');
+
+/**
+ * A note attached to a student. It can be a general note, or scoped to a
+ * specific lesson or exam result. Authors can be admin, teacher, or parent.
+ * Content supports text + media (image/video URLs) and is multi-language.
+ */
+const noteSchema = new mongoose.Schema(
+  {
+    student: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
+
+    // Author (polymorphic by role)
+    authorRole: { type: String, enum: ['admin', 'teacher', 'parent'], required: true },
+    authorId: { type: mongoose.Schema.Types.ObjectId, required: true },
+    authorName: { type: String, default: '' }, // denormalised for quick display
+
+    // Scope
+    scope: { type: String, enum: ['general', 'lesson', 'exam'], default: 'general' },
+    lesson: { type: mongoose.Schema.Types.ObjectId, ref: 'Lesson' },
+    exam: { type: mongoose.Schema.Types.ObjectId, ref: 'Exam' },
+    examResult: { type: mongoose.Schema.Types.ObjectId, ref: 'ExamResult' },
+
+    text: { type: MultiLangString, default: () => ({}) },
+    imageUrl: { type: String, default: '' },
+    videoUrl: { type: String, default: '' },
+  },
+  { timestamps: true }
+);
+
+noteSchema.index({ student: 1, scope: 1, createdAt: -1 });
+
+module.exports = mongoose.model('Note', noteSchema);
+
+
+models/Parent.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const parentSchema = new mongoose.Schema(
+  {
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true, minlength: 6 },
+    phone: { type: String, default: '' },
+    role: { type: String, default: 'parent', immutable: true },
+    // Password reset
+    resetTokenHash: { type: String, default: '' },
+    resetTokenExpires: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
+parentSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
+
+parentSchema.methods.matchPassword = function (entered) {
+  return bcrypt.compare(entered, this.password);
+};
+
+module.exports = mongoose.model('Parent', parentSchema);
+
+
+models/Payment.js
+const mongoose = require('mongoose');
+
+const paymentSchema = new mongoose.Schema(
+  {
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher', required: true },
+    hoursWorked: { type: Number, required: true, min: 0 },
+    hourlyRate: { type: Number, required: true, min: 0 },
+    grossAmount: { type: Number, required: true, min: 0 },
+
+    periodFrom: { type: Date },
+    periodTo: { type: Date },
+
+    // PDF gets generated lazily — store the file path once produced.
+    pdfPath: { type: String, default: '' },
+
+    notes: { type: String, default: '' },
+    issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+
+    // Optional day-level breakdown when the payment was generated from
+    // recorded teacher-attendance. Each entry is one working day:
+    //   { date: Date, hours: [1, 2, 3] }
+    // If absent, the payment was created the old way (single hoursWorked
+    // number) and the payslip falls back to a single-row layout.
+    breakdown: {
+      type: [{
+        date:  { type: Date, required: true },
+        hours: { type: [Number], default: [] },
+      }],
+      default: undefined,
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Payment', paymentSchema);
+
+
+models/RegistrationRequest.js
+const mongoose = require('mongoose');
+
+/**
+ * A pending sign-up. The public registration form (parent + student fields
+ * in one payload) creates one of these. An admin reviews it and either
+ * approves (which creates the real Parent + Student documents) or rejects
+ * (with an optional reason that goes into the rejection email).
+ *
+ * The shape of `parent` and `student` mirrors the relevant fields on those
+ * models; passwords are NOT collected here — they're auto-generated on
+ * approval using the existing `[firstname][lastname]salahaddin` rule.
+ */
+const registrationRequestSchema = new mongoose.Schema(
+  {
+    status: {
+      type: String,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'pending',
+      index: true,
+    },
+
+    parent: {
+      firstName: { type: String, required: true, trim: true },
+      lastName: { type: String, required: true, trim: true },
+      email: { type: String, required: true, trim: true, lowercase: true },
+      phone: { type: String, default: '' },
+    },
+
+    student: {
+      firstName: { type: String, required: true, trim: true },
+      lastName: { type: String, required: true, trim: true },
+      email: { type: String, required: true, trim: true, lowercase: true },
+      level: { type: String, enum: ['A', 'B', 'C', 'D'], default: 'A' },
+      gender: { type: String, enum: ['male', 'female'], default: 'male' },
+    },
+
+    message: { type: String, default: '' },          // optional note from family
+    rejectionReason: { type: String, default: '' },  // set when status='rejected'
+    decidedAt: { type: Date, default: null },
+    decidedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('RegistrationRequest', registrationRequestSchema);
+
+
+models/Student.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const studentSchema = new mongoose.Schema(
+  {
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true, minlength: 6 },
+    photo: { type: String, default: '' },
+    parent: { type: mongoose.Schema.Types.ObjectId, ref: 'Parent' },
+    level: { type: String, enum: ['A', 'B', 'C', 'D'], required: true },
+    gender: { type: String, enum: ['male', 'female'], default: 'male' }, // drives accent colour
+    paidAmount: { type: Number, default: 0 },
+    birthDate: { type: Date, default: null },
+    role: { type: String, default: 'student', immutable: true },
+
+    // Progressive unlock:
+    //  - completedUnits: unit ids whose final exam has been passed (legacy
+    //    unit-level unlock; still respected)
+    //  - viewedLessons:  ids of lessons the student has opened — unlocking
+    //    the next lesson in the same section
+    completedUnits: [{ type: mongoose.Schema.Types.ObjectId }],
+    viewedLessons: [{ type: mongoose.Schema.Types.ObjectId }],
+    // Password reset
+    resetTokenHash: { type: String, default: '' },
+    resetTokenExpires: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
+studentSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
+
+studentSchema.methods.matchPassword = function (entered) {
+  return bcrypt.compare(entered, this.password);
+};
+
+module.exports = mongoose.model('Student', studentSchema);
+
+
+models/Teacher.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const teacherSchema = new mongoose.Schema(
+  {
+    firstName: { type: String, required: true, trim: true },
+    lastName: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    password: { type: String, required: true, minlength: 6 },
+    phone: { type: String, default: '' },
+    photo: { type: String, default: '' },
+    role: { type: String, default: 'teacher', immutable: true },
+    hourlyRate: { type: Number, default: 0 }, // used for payslip generation
+    // Password reset
+    resetTokenHash: { type: String, default: '' },
+    resetTokenExpires: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
+teacherSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
+
+teacherSchema.methods.matchPassword = function (entered) {
+  return bcrypt.compare(entered, this.password);
+};
+
+module.exports = mongoose.model('Teacher', teacherSchema);
+
+
+models/TeacherAttendance.js
+const mongoose = require('mongoose');
+
+/**
+ * One record per (teacher, day). The `hours` array holds the integer
+ * hour-numbers the teacher actually worked that day — the spec uses
+ * "1st h / 2nd h / 3rd h" but we keep it as a flexible array of integers
+ * so a fourth (or fifth) hour can be added later without a migration.
+ *
+ * Saving for a (teacher, day) that already has a record overwrites it, so
+ * the admin can revise without creating duplicates. That's enforced by the
+ * bulkUpsert path on the controller.
+ */
+const teacherAttendanceSchema = new mongoose.Schema(
+  {
+    teacher: { type: mongoose.Schema.Types.ObjectId, ref: 'Teacher', required: true },
+    date: { type: Date, required: true },
+    hours: {
+      type: [Number],
+      default: [],
+      validate: {
+        validator: (arr) => arr.every((n) => Number.isInteger(n) && n >= 1 && n <= 12),
+        message: 'hours must be integers between 1 and 12',
+      },
+    },
+    note: { type: String, default: '' },
+    recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' },
+  },
+  { timestamps: true }
+);
+
+// Quick lookups by date and per-teacher.
+teacherAttendanceSchema.index({ date: 1 });
+teacherAttendanceSchema.index({ teacher: 1, date: -1 });
+// One record per (teacher, day). The bulkWrite uses upsert against this
+// pair so the unique index isn't strictly required, but it's cheap insurance.
+teacherAttendanceSchema.index({ teacher: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('TeacherAttendance', teacherAttendanceSchema);
+
+
+models/_shared.js
+const { Schema } = require('mongoose');
+
+/**
+ * Multi-language string. Every user-facing text in the DB uses this shape:
+ *   { en: '...', ar: '...', nl: '...' }
+ */
+const MultiLangString = new Schema(
+  {
+    en: { type: String, default: '' },
+    ar: { type: String, default: '' },
+    nl: { type: String, default: '' },
+  },
+  { _id: false }
+);
+
+/**
+ * Single icon entry inside an `imageWithIcons` block. Each icon has its own
+ * image (typically a small PNG/SVG of a boy / girl / man) and its own audio
+ * which plays when the icon is tapped.
+ */
+const IconEntry = new Schema(
+  {
+    kind: { type: String, enum: ['boy', 'girl', 'man'], required: true },
+    iconUrl: { type: String, default: '' },   // small image displayed as the icon
+    audioUrl: { type: String, default: '' },  // audio that plays on tap
+    label: { type: MultiLangString, default: () => ({}) }, // optional caption per icon
+  },
+  { _id: false }
+);
+
+/**
+ * Flexible content block. Used by Lesson and News.
+ *
+ *   text           { content: MultiLangString }
+ *   image          { url, size }
+ *   video          { url, size }
+ *   imageAudio     { url, audioUrl, size }
+ *   imageWithIcons { url, icons: [{kind, iconUrl, audioUrl, label}], size }
+ *
+ * `size` is one of '25' | '50' | '75' | '100' (percent of the row). The
+ * lesson/news viewer puts blocks inside a flex-wrap row so e.g. four 25%
+ * blocks land on the same line.
+ */
+const ContentBlock = new Schema(
+  {
+    type: {
+      type: String,
+      enum: ['text', 'image', 'video', 'imageAudio', 'imageWithIcons'],
+      required: true,
+    },
+    order: { type: Number, default: 0 },
+    size: { type: String, enum: ['25', '50', '75', '100'], default: '100' },
+    // text
+    content: { type: MultiLangString, default: () => ({}) },
+    // media
+    url: { type: String, default: '' },
+    audioUrl: { type: String, default: '' },
+    // imageWithIcons
+    icons: { type: [IconEntry], default: undefined },
+    // optional caption (multi-lang)
+    caption: { type: MultiLangString, default: () => ({}) },
+  },
+  { _id: true }
+);
+
+module.exports = { MultiLangString, ContentBlock };
+
+
+routes/attendance.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/attendanceController');
+
+router.use(protect);
+
+router.get('/', allow('admin', 'teacher'), ctrl.byDate);
+router.get('/range', allow('admin', 'teacher'), ctrl.byDateRange);
+router.post('/', allow('admin', 'teacher'), ctrl.create);
+router.post('/bulk', allow('admin', 'teacher'), ctrl.bulkUpsert);
+router.get('/student/:id', allow('admin', 'teacher', 'parent', 'student'), ctrl.byStudent);
+router.put('/:id', allow('admin', 'teacher'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/auth.js
+const express = require('express');
+const router = express.Router();
+const { protect } = require('../middleware/auth');
+const ctrl = require('../controllers/authController');
+
+router.post('/login', ctrl.login);
+router.post('/forgot-password', ctrl.forgotPassword);
+router.post('/reset-password-with-token', ctrl.resetPasswordWithToken);
+router.get('/me', protect, ctrl.me);
+router.post('/reset-password', protect, ctrl.resetPassword);
+router.put('/profile', protect, ctrl.updateProfile);
+
+module.exports = router;
+
+
+routes/calendar.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/calendarController');
+
+router.use(protect);
+
+router.get('/', allow('admin', 'teacher'), ctrl.list);
+router.post('/', allow('admin', 'teacher'), ctrl.create);
+router.put('/:id', allow('admin', 'teacher'), ctrl.update);
+router.delete('/:id', allow('admin', 'teacher'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/examResults.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/examResultController');
+
+router.use(protect);
+
+router.get('/', allow('admin', 'teacher', 'parent', 'student'), ctrl.listAll);
+router.get('/student/:id', allow('admin', 'teacher', 'parent', 'student'), ctrl.byStudent);
+router.get('/:id', allow('admin', 'teacher', 'parent', 'student'), ctrl.getOne);
+router.put('/:id/feedback', allow('admin', 'teacher'), ctrl.addFeedback);
+
+module.exports = router;
+
+
+routes/exams.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/examController');
+
+router.use(protect);
+
+router.get('/', allow('admin', 'teacher', 'student', 'parent'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher', 'student', 'parent'), ctrl.getOne);
+router.post('/', allow('admin', 'teacher'), ctrl.create);
+router.put('/:id', allow('admin', 'teacher'), ctrl.update);
+router.delete('/:id', allow('admin', 'teacher'), ctrl.remove);
+
+router.post('/:id/submit', allow('student'), ctrl.submit);
+
+module.exports = router;
+
+
+routes/expenses.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/expenseController');
+
+router.use(protect);
+
+router.get('/', allow('admin'), ctrl.list);
+router.post('/', allow('admin'), ctrl.create);
+router.put('/:id', allow('admin'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/homeworks.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/homeworkController');
+
+router.use(protect);
+
+// CRUD
+router.get('/', allow('admin', 'teacher', 'student', 'parent'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher', 'student', 'parent'), ctrl.getOne);
+router.post('/', allow('admin', 'teacher'), ctrl.create);
+router.put('/:id', allow('admin', 'teacher'), ctrl.update);
+router.delete('/:id', allow('admin', 'teacher'), ctrl.remove);
+
+// Student submission
+router.post('/:id/submit', allow('student'), ctrl.submit);
+
+// Parent note (for book reading)
+router.post('/:id/parent-note', allow('parent'), ctrl.parentNote);
+
+// Teacher / admin review
+router.get('/:id/submissions', allow('admin', 'teacher'), ctrl.listSubmissions);
+
+// Single (homework, student) submission lookup — used by parents to read
+// their children's submission, by students to read their own, by teachers/
+// admins for any. The controller enforces per-role limits.
+router.get('/:id/submission', allow('admin', 'teacher', 'parent', 'student'), ctrl.getOneSubmission);
+
+module.exports = router;
+
+
+routes/homeworkSubmissions.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/homeworkController');
+
+router.use(protect);
+
+router.put('/:id', allow('admin', 'teacher'), ctrl.updateSubmission);
+
+module.exports = router;
+
+
+routes/lessons.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/lessonController');
+
+router.use(protect);
+
+router.get('/', allow('admin', 'teacher', 'student'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher', 'student'), ctrl.getOne);
+router.post('/', allow('admin', 'teacher'), ctrl.create);
+router.put('/:id', allow('admin', 'teacher'), ctrl.update);
+router.delete('/:id', allow('admin', 'teacher'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/news.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/newsController');
+
+// Public
+router.get('/', ctrl.list);
+router.get('/:id', ctrl.getOne);
+
+// Admin
+router.post('/', protect, allow('admin'), ctrl.create);
+router.put('/:id', protect, allow('admin'), ctrl.update);
+router.delete('/:id', protect, allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/notes.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/noteController');
+
+router.use(protect);
+
+router.get('/student/:id', allow('admin', 'teacher', 'parent', 'student'), ctrl.byStudent);
+router.post('/', allow('admin', 'teacher', 'parent'), ctrl.create);
+router.put('/:id', allow('admin', 'teacher', 'parent'), ctrl.update);
+router.delete('/:id', allow('admin', 'teacher', 'parent'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/parents.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/parentController');
+
+router.use(protect);
+
+// Parent's own children — must come before /:id
+router.get('/me/children', allow('parent'), ctrl.myChildren);
+
+router.get('/', allow('admin'), ctrl.list);
+router.get('/:id', allow('admin', 'parent'), ctrl.getOne);
+router.post('/', allow('admin'), ctrl.create);
+router.put('/:id', allow('admin'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/payments.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/paymentController');
+
+router.use(protect);
+
+router.get('/preview-from-attendance', allow('admin'), ctrl.previewFromAttendance);
+router.get('/', allow('admin', 'teacher'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher'), ctrl.getOne);
+router.get('/:id/payslip', allow('admin', 'teacher'), ctrl.payslip);
+router.post('/', allow('admin'), ctrl.create);
+router.put('/:id', allow('admin'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/registrations.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/registrationController');
+
+// Public: submit a new request
+router.post('/', ctrl.submit);
+
+// Admin
+router.get('/', protect, allow('admin'), ctrl.list);
+router.post('/:id/approve', protect, allow('admin'), ctrl.approve);
+router.post('/:id/reject', protect, allow('admin'), ctrl.reject);
+router.delete('/:id', protect, allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/students.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/studentController');
+
+router.use(protect);
+
+router.get('/upcoming-birthdays', allow('admin', 'teacher'), ctrl.upcomingBirthdays);
+router.get('/', allow('admin', 'teacher', 'parent'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher', 'parent', 'student'), ctrl.getOne);
+router.post('/', allow('admin'), ctrl.create);
+router.put('/:id', allow('admin'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/teacherAttendance.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/teacherAttendanceController');
+
+router.use(protect);
+
+router.get('/', allow('admin'), ctrl.byDate);
+router.get('/range', allow('admin'), ctrl.byRange);
+router.post('/bulk', allow('admin'), ctrl.bulkUpsert);
+
+module.exports = router;
+
+
+routes/teachers.js
+const express = require('express');
+const router = express.Router();
+const { protect, allow } = require('../middleware/auth');
+const ctrl = require('../controllers/teacherController');
+
+router.use(protect);
+
+router.get('/', allow('admin'), ctrl.list);
+router.get('/:id', allow('admin', 'teacher'), ctrl.getOne);
+router.post('/', allow('admin'), ctrl.create);
+router.put('/:id', allow('admin'), ctrl.update);
+router.delete('/:id', allow('admin'), ctrl.remove);
+
+module.exports = router;
+
+
+routes/upload.js
+const express = require('express');
+const router = express.Router();
+const { protect } = require('../middleware/auth');
+const upload = require('../middleware/upload');
+
+/**
+ * POST /api/upload
+ * Field: 'file'
+ * Returns: { url: '/uploads/...filename', mimetype, size, originalname }
+ *
+ * Any authenticated user may upload — the frontend sends profile photos,
+ * lesson images/videos/audio, and note attachments through this endpoint.
+ */
+router.post('/', protect, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+  res.status(201).json({
+    url: `/uploads/${req.file.filename}`,
+    mimetype: req.file.mimetype,
+    size: req.file.size,
+    originalname: req.file.originalname,
+  });
+});
+
+module.exports = router;
+
+
+utils/generatePassword.js
+/**
+ * Auto-generate a password from a person's name following the project rule:
+ *   [firstName][lastName]salahaddin   (lowercase, no spaces)
+ *
+ * Example: ('John', 'Doe Smith') -> 'johndoesmithsalahaddin'
+ */
+function generatePassword(firstName, lastName) {
+  const clean = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
+  return `${clean(firstName)}${clean(lastName)}salahaddin`;
+}
+
+module.exports = generatePassword;
+
+
+utils/generatePayslipPDF.js
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Minimalist payslip layout (one page, A4 portrait, 50pt margins):
+ *
+ *   ISSUED TO                    PAY PERIOD
+ *   Name                         From:    DD/MM/YYYY
+ *   Email                        To:      DD/MM/YYYY
+ *   Phone                        Issued:  DD/MM/YYYY
+ *   ────────────────────────────────────────────
+ *   EARNINGS
+ *   Description       Hours    Rate     Amount
+ *   ...rows...
+ *   ────────────────────────────────────────────
+ *                            ┌─────────────┐
+ *                            │ TOTAL DUE   │
+ *                            │ € XX.XX     │
+ *                            └─────────────┘
+ *
+ *   NOTES (if any)
+ *
+ *   Authorised signature       Teacher signature
+ *   ___________________        ___________________
+ *
+ * No brand header, reference, or footer. Sections flow naturally with a
+ * tracked Y cursor so the page never overflows.
+ */
+
+const PALETTE = {
+  primary:    '#0D274D',
+  primaryFg:  '#FFFFFF',
+  accent:     '#C9A054',
+  ink:        '#111827',
+  body:       '#374151',
+  muted:      '#6B7280',
+  divider:    '#E5E7EB',
+  zebra:      '#F8FAFC',
+};
+
+function generatePayslipPDF(payment, teacher) {
+  return new Promise((resolve, reject) => {
+    try {
+      const dir = path.join(__dirname, '..', 'uploads', 'payslips');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+      const fileName = `payslip_${payment._id}.pdf`;
+      const filePath = path.join(dir, fileName);
+      const stream = fs.createWriteStream(filePath);
+
+      const doc = new PDFDocument({ size: 'A4', margin: 50 });
+      doc.pipe(stream);
+
+      // Track the cursor ourselves so each section knows where to start.
+      // Starts at the top margin (50).
+      let y = 50;
+
+      y = drawInfoColumns(doc, y, teacher, payment);
+      y = drawEarningsTable(doc, y, payment);
+      y = drawTotalsPanel(doc, y, payment);
+      if (payment.notes) y = drawNotes(doc, y, payment.notes);
+      drawSignatures(doc, y);
+
+      doc.end();
+      stream.on('finish', () => resolve(filePath));
+      stream.on('error', reject);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+/* ------------------------------------------------------- shared helpers */
+
+const eur = (n) => `€ ${Number(n || 0).toFixed(2)}`;
+const fmt = (d) => d ? new Date(d).toLocaleDateString('en-GB') : '—';
+
+/* ---------------------------------------------- "Issued to" + "Pay period" */
+
+function drawInfoColumns(doc, startY, teacher, payment) {
+  const colW = 240;
+  const leftX = 50;
+  const rightX = doc.page.width - 50 - colW;
+  let y = startY;
+
+  // Column titles + thin underlines
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PALETTE.muted);
+  doc.text('ISSUED TO', leftX, y, { lineBreak: false });
+  doc.text('PAY PERIOD', rightX, y, { lineBreak: false });
+
+  y += 14;
+  doc.strokeColor(PALETTE.divider).lineWidth(0.8)
+     .moveTo(leftX, y).lineTo(leftX + colW, y).stroke()
+     .moveTo(rightX, y).lineTo(rightX + colW, y).stroke();
+  y += 8;
+
+  // Left column — teacher details
+  doc.font('Helvetica-Bold').fontSize(12).fillColor(PALETTE.ink)
+     .text(`${teacher.firstName} ${teacher.lastName}`, leftX, y, { width: colW });
+  doc.font('Helvetica').fontSize(10).fillColor(PALETTE.body)
+     .text(teacher.email || '', leftX, doc.y, { width: colW })
+     .text(teacher.phone || '', leftX, doc.y, { width: colW });
+  const leftBottom = doc.y;
+
+  // Right column — period (manually positioned so both columns share the
+  // same starting Y and grow independently without affecting each other)
+  let ry = y;
+  const labelW = 60;
+  drawKV(doc, rightX, ry,        labelW, 'From:',   fmt(payment.periodFrom)); ry += 16;
+  drawKV(doc, rightX, ry,        labelW, 'To:',     fmt(payment.periodTo));   ry += 16;
+  drawKV(doc, rightX, ry,        labelW, 'Issued:', fmt(payment.createdAt));  ry += 16;
+  const rightBottom = ry;
+
+  return Math.max(leftBottom, rightBottom) + 24;
+}
+
+function drawKV(doc, x, y, labelW, label, value) {
+  doc.font('Helvetica').fontSize(10);
+  doc.fillColor(PALETTE.muted).text(label, x, y, { width: labelW, lineBreak: false });
+  doc.fillColor(PALETTE.ink).text(String(value), x + labelW, y, { lineBreak: false });
+}
+
+/* ---------------------------------------------------------- earnings table */
+
+function drawEarningsTable(doc, startY, payment) {
+  const x = 50;
+  const w = doc.page.width - 100;
+  let y = startY;
+
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PALETTE.muted)
+     .text('EARNINGS', x, y, { lineBreak: false });
+  y += 14;
+
+  const cols = [
+    { label: 'Description', x: x + 10,  w: 220, align: 'left'  },
+    { label: 'Hours',       x: x + 240, w: 70,  align: 'right' },
+    { label: 'Rate',        x: x + 320, w: 80,  align: 'right' },
+    { label: 'Amount',      x: x + 410, w: 90,  align: 'right' },
+  ];
+
+  // Header row
+  doc.rect(x, y, w, 22).fill(PALETTE.primary);
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PALETTE.primaryFg);
+  for (const c of cols) {
+    doc.text(c.label, c.x, y + 6, { width: c.w, align: c.align, lineBreak: false });
+  }
+  y += 22;
+
+  // Rows: from `breakdown` if present, otherwise a single fallback row.
+  const rate = Number(payment.hourlyRate || 0);
+  const rows = (Array.isArray(payment.breakdown) && payment.breakdown.length > 0)
+    ? payment.breakdown.map((b) => {
+        const hourCount = (b.hours || []).length;
+        const dateLabel = new Date(b.date).toLocaleDateString('en-GB');
+        const hoursText = (b.hours || []).join(', ') || '—';
+        return {
+          desc: `${dateLabel}  ·  hours: ${hoursText}`,
+          hours: hourCount,
+          amount: hourCount * rate,
+        };
+      })
+    : [{
+        desc: 'Teaching hours',
+        hours: Number(payment.hoursWorked || 0),
+        amount: Number(payment.grossAmount || 0),
+      }];
+
+  const rowH = 22;
+  doc.font('Helvetica').fontSize(10);
+  rows.forEach((row, i) => {
+    if (i % 2 === 0) doc.rect(x, y, w, rowH).fill(PALETTE.zebra);
+    doc.fillColor(PALETTE.ink);
+    doc.text(row.desc,            cols[0].x, y + 7, { width: cols[0].w, align: cols[0].align, lineBreak: false });
+    doc.text(String(row.hours),   cols[1].x, y + 7, { width: cols[1].w, align: cols[1].align, lineBreak: false });
+    doc.text(eur(rate),           cols[2].x, y + 7, { width: cols[2].w, align: cols[2].align, lineBreak: false });
+    doc.text(eur(row.amount),     cols[3].x, y + 7, { width: cols[3].w, align: cols[3].align, lineBreak: false });
+    y += rowH;
+  });
+
+  doc.strokeColor(PALETTE.divider).lineWidth(0.8)
+     .moveTo(x, y).lineTo(x + w, y).stroke();
+
+  return y + 16;
+}
+
+/* ----------------------------------------------------------- totals panel */
+
+function drawTotalsPanel(doc, startY, payment) {
+  const w = 200;
+  const h = 56;
+  const x = doc.page.width - 50 - w;
+  const y = startY;
+
+  doc.rect(x, y, w, h).fill(PALETTE.primary);
+  doc.font('Helvetica').fontSize(10).fillColor('#FFFFFFCC')
+     .text('TOTAL DUE', x + 14, y + 10, { width: w - 28, lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(20).fillColor(PALETTE.primaryFg)
+     .text(eur(payment.grossAmount), x + 14, y + 24, { width: w - 28, lineBreak: false });
+
+  // Slim accent stripe on the leading edge.
+  doc.rect(x, y, 4, h).fill(PALETTE.accent);
+
+  return y + h + 24;
+}
+
+/* ----------------------------------------------------------------- notes */
+
+function drawNotes(doc, startY, notes) {
+  const x = 50;
+  const w = doc.page.width - 100;
+  let y = startY;
+
+  doc.font('Helvetica-Bold').fontSize(10).fillColor(PALETTE.muted)
+     .text('NOTES', x, y, { lineBreak: false });
+  y += 14;
+
+  doc.font('Helvetica').fontSize(10).fillColor(PALETTE.body);
+  doc.text(String(notes), x, y, { width: w });
+
+  return doc.y + 16;
+}
+
+/* ------------------------------------------------------------- signatures */
+
+/**
+ * Signature block flows naturally after the body content, with a small
+ * extra gap. We anchor it to AT LEAST a known Y (so it doesn't sit too
+ * close to a short body), but never push it off the page.
+ *
+ * Two columns side by side: authorised on the left, teacher on the right.
+ */
+function drawSignatures(doc, afterBodyY) {
+  // Sit comfortably below the body. If the body ended early, push the
+  // signatures down to ~600 so they don't look orphaned right below the
+  // total. If the body ended late, keep the natural position.
+  const minY = 600;
+  let y = Math.max(afterBodyY + 24, minY);
+
+  // Last-resort safety: never pass the bottom margin. If we'd be too low,
+  // pull the signatures up to a sensible bottom-anchored position. This
+  // also prevents PDFKit from auto-pagebreaking.
+  const bottomCap = doc.page.height - 100;
+  if (y > bottomCap) y = bottomCap;
+
+  const colW = 220;
+  const left = 50;
+  const right = doc.page.width - 50 - colW;
+  const lineY = y + 30;
+
+  doc.font('Helvetica').fontSize(10).fillColor(PALETTE.muted);
+  doc.text('Authorised signature', left, y,  { width: colW, lineBreak: false });
+  doc.text('Teacher signature',    right, y, { width: colW, lineBreak: false });
+
+  doc.strokeColor(PALETTE.ink).lineWidth(0.8)
+     .moveTo(left,  lineY).lineTo(left + colW,  lineY).stroke()
+     .moveTo(right, lineY).lineTo(right + colW, lineY).stroke();
+
+  doc.fontSize(8).fillColor(PALETTE.muted);
+  doc.text('Signature & date', left, lineY + 4, { width: colW, lineBreak: false });
+  doc.text('Date: __________________', right, lineY + 4, { width: colW, lineBreak: false });
+}
+
+module.exports = generatePayslipPDF;
+
+
+utils/generateToken.js
+const jwt = require('jsonwebtoken');
+
+/**
+ * Generate a signed JWT for a user. We embed `id` and `role` so middleware
+ * can route the verify-step to the correct collection without a DB lookup.
+ */
+function generateToken(id, role) {
+  return jwt.sign({ id, role }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '30d',
+  });
+}
+
+module.exports = generateToken;
+
+
+utils/mail.js
+const nodemailer = require('nodemailer');
+
+let transporter = null;
+let usingConsole = false;
+
+function getTransporter() {
+  if (transporter) return transporter;
+
+  if (!process.env.SMTP_HOST) {
+    usingConsole = true;
+    transporter = {
+      sendMail: async (opts) => {
+        // Stand-in: print the email so dev can read it from the server log.
+        console.log('\n----- [DEV MAIL] -----');
+        console.log('To:      ', opts.to);
+        console.log('Subject: ', opts.subject);
+        console.log('Text:    \n' + (opts.text || ''));
+        console.log('----- [/DEV MAIL] -----\n');
+        return { messageId: 'dev-' + Date.now() };
+      },
+    };
+    return transporter;
+  }
+
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      : undefined,
+  });
+  return transporter;
+}
+
+/** Single-language send. Kept for any callers that don't need translations. */
+async function sendMail({ to, subject, text, html }) {
+  try {
+    const tr = getTransporter();
+    const from = process.env.MAIL_FROM || 'Salah al-Din <no-reply@school.local>';
+    await tr.sendMail({ from, to, subject, text, html });
+    return true;
+  } catch (err) {
+    console.error('Mail send failed:', err.message);
+    return false;
+  }
+}
+
+/**
+ * Trilingual send. Caller passes:
+ *
+ *   {
+ *     to: 'parent@example.com',
+ *     subject: { ar: '...', en: '...', nl: '...' },
+ *     text:    { ar: '...', en: '...', nl: '...' },
+ *   }
+ *
+ * The recipient gets ONE message that contains all three versions, in the
+ * order Arabic → English → Dutch, separated by a clear divider line and a
+ * language label so the reader can find their language quickly. The Subject
+ * line concatenates all three with a separator. If a language is missing
+ * from the input, that section is simply skipped.
+ *
+ * We send to all recipients regardless of which language they prefer — we
+ * don't store a language preference per user yet, and being trilingual on
+ * outgoing email is what the requirement asks for.
+ */
+async function sendMailMulti({ to, subject, text }) {
+  // The order of the languages in the email body. Arabic first because it's
+  // the school's primary language; English second as the lingua-franca
+  // fallback; Dutch third for local context.
+  const ORDER = [
+    { code: 'ar', label: 'العربية' },
+    { code: 'en', label: 'English' },
+    { code: 'nl', label: 'Nederlands' },
+  ];
+
+  const safe = (obj, code) =>
+    obj && typeof obj === 'object' ? (obj[code] || '').trim() : (obj || '').toString().trim();
+
+  // Subject: join the three (in the order above), filtering out empty ones.
+  const subjectParts = ORDER.map((l) => safe(subject, l.code)).filter(Boolean);
+  const finalSubject = subjectParts.join(' · ') || 'Salah al-Din';
+
+  // Body: each section gets a header line with the language label, then
+  // a divider between sections.
+  const DIVIDER = '\n────────────────────\n';
+  const sections = ORDER
+    .map((l) => {
+      const body = safe(text, l.code);
+      if (!body) return null;
+      return `[${l.label}]\n${body}`;
+    })
+    .filter(Boolean);
+
+  const finalText = sections.join(DIVIDER);
+
+  return sendMail({ to, subject: finalSubject, text: finalText });
+}
+
+module.exports = {
+  sendMail,
+  sendMailMulti,
+  isUsingConsoleTransport: () => usingConsole,
+};
+
+
+utils/seed.js
+/**
+ * Seed script. Run with `npm run seed`.
+ * Creates a default admin (idempotent) and a handful of demo records so the
+ * UI has something to render on first boot.
+ */
+require('dotenv').config();
+const mongoose = require('mongoose');
+const connectDB = require('../config/db');
+
+const Admin = require('../models/Admin');
+const Teacher = require('../models/Teacher');
+const Parent = require('../models/Parent');
+const Student = require('../models/Student');
+const News = require('../models/News');
+const generatePassword = require('./generatePassword');
+
+async function run() {
+  await connectDB();
+
+  // Default admin
+  let admin = await Admin.findOne({ email: 'admin@school.com' });
+  if (!admin) {
+    admin = await Admin.create({
+      firstName: 'Site',
+      lastName: 'Admin',
+      email: 'admin@school.com',
+      password: 'admin12345',
+      phone: '+32 000 000 000',
+    });
+    console.log('Created admin: admin@school.com / admin12345');
+  } else {
+    console.log('Admin already exists');
+  }
+
+  // Sample teacher
+  let teacher = await Teacher.findOne({ email: 'teacher@school.com' });
+  if (!teacher) {
+    teacher = await Teacher.create({
+      firstName: 'Yusuf',
+      lastName: 'Al-Khatib',
+      email: 'teacher@school.com',
+      password: generatePassword('Yusuf', 'Al-Khatib'),
+      phone: '+32 111 111 111',
+      hourlyRate: 30,
+    });
+    console.log(`Created teacher: teacher@school.com / ${generatePassword('Yusuf', 'Al-Khatib')}`);
+  }
+
+  // Sample parent
+  let parent = await Parent.findOne({ email: 'parent@school.com' });
+  if (!parent) {
+    parent = await Parent.create({
+      firstName: 'Amina',
+      lastName: 'Hassan',
+      email: 'parent@school.com',
+      password: generatePassword('Amina', 'Hassan'),
+      phone: '+32 222 222 222',
+    });
+    console.log(`Created parent: parent@school.com / ${generatePassword('Amina', 'Hassan')}`);
+  }
+
+  // Sample student
+  let student = await Student.findOne({ email: 'student@school.com' });
+  if (!student) {
+    student = await Student.create({
+      firstName: 'Omar',
+      lastName: 'Hassan',
+      email: 'student@school.com',
+      password: generatePassword('Omar', 'Hassan'),
+      parent: parent._id,
+      level: 'A',
+      gender: 'male',
+      paidAmount: 0,
+    });
+    console.log(`Created student: student@school.com / ${generatePassword('Omar', 'Hassan')}`);
+  }
+
+  // Sample news
+  const newsCount = await News.countDocuments();
+  if (newsCount === 0) {
+    await News.create({
+      title: {
+        en: 'Welcome to Salah al-Din School',
+        ar: 'مرحبا بكم في مدرسة صلاح الدين',
+        nl: 'Welkom bij Salah al-Din school',
+      },
+      blocks: [
+        {
+          type: 'text',
+          order: 0,
+          size: '100',
+          content: {
+            en: 'We are delighted to welcome new students for the upcoming year.',
+            ar: 'يسعدنا أن نرحب بالطلاب الجدد للعام الدراسي القادم.',
+            nl: 'Wij verwelkomen graag nieuwe leerlingen voor het komende schooljaar.',
+          },
+        },
+      ],
+      author: admin._id,
+      published: true,
+    });
+    console.log('Created sample news');
+  }
+
+  console.log('Seed complete.');
+  await mongoose.connection.close();
+  process.exit(0);
+}
+
+run().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+
